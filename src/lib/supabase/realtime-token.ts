@@ -1,3 +1,4 @@
+
 import "server-only";
 
 import { importJWK, SignJWT, type JWK } from "jose";
@@ -9,9 +10,12 @@ type SigningJWK = JWK & {
   d?: string;
 };
 
-export async function createSupabaseRealtimeToken(userId: string) {
-  if (!userId) {
-    throw new Error("A valid application user ID is required.");
+export async function createSupabaseRealtimeToken(
+  userId: string,
+  roomId: string
+) {
+  if (!userId || !roomId) {
+    throw new Error("User ID and room ID are required.");
   }
 
   const rawJwk = process.env.SUPABASE_JWT_PRIVATE_JWK;
@@ -31,12 +35,13 @@ export async function createSupabaseRealtimeToken(userId: string) {
   if (
     jwk.kty !== "EC" ||
     jwk.crv !== "P-256" ||
+    jwk.alg !== "ES256" ||
     !jwk.kid ||
     !jwk.d ||
     !jwk.x ||
     !jwk.y
   ) {
-    throw new Error("Invalid ES256 private signing key.");
+    throw new Error("Invalid ES256 signing key.");
   }
 
   const privateKey = await importJWK(jwk, "ES256");
@@ -44,6 +49,7 @@ export async function createSupabaseRealtimeToken(userId: string) {
   return new SignJWT({
     role: "authenticated",
     app_user_id: userId,
+    room_id: roomId,
   })
     .setProtectedHeader({
       alg: "ES256",

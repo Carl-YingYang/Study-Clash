@@ -37,6 +37,10 @@
     ".next/dev/types/**/*.ts"
   ],
   "exclude": [
-    "node_modules"
+    "node_modules",
+    "examples/websocket/server.ts",
+    "mini-services/game-service/**",
+    "scripts/e2e-verify.ts",
+    "scripts/join-regression.ts"
   ]
 }

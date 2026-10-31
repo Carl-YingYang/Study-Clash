@@ -130,6 +130,7 @@ export interface QuestionPayload {
   timerMs: number;
   endsAt: number; // your personal deadline (server epoch ms)
   serverTime: number;
+  youAnswered?: number | null;
 }
 
 export interface RoundResultPayload {
