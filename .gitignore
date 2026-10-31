@@ -54,3 +54,4 @@ prompt
 server.log
 # Skills directory
 /skills/
+supabase/signing_keys.json
