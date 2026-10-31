@@ -1,0 +1,1054 @@
+     1→     1→// STUDY CLASH — realtime game engine
+     2→     2→// ---------------------------------------------------------------------------
+     3→     3→// Security model:
+     4→     4→//  - Clients authenticate with an HMAC token issued by the Next.js API.
+     5→     5→//  - The answer key (correctIndex) lives ONLY in this service and the DB.
+     6→     6→//    It is never included in any payload sent before a round locks.
+     7→     7→//  - All scoring, timers, ability validation and progression are authoritative
+     8→     8→//    server-side. Clients only render state.
+     9→     9→// ---------------------------------------------------------------------------
+    10→    10→import type { Server, Socket } from "socket.io";
+    11→    11→import { db } from "./db";
+    12→    12→import { verifyGameToken } from "./token";
+    13→    13→import {
+    14→    14→  computeQuestionScore,
+    15→    15→  REVEAL_SECONDS,
+    16→    16→  COUNTDOWN_SECONDS,
+    17→    17→  SPRINTER_EXTRA_MS,
+    18→    18→  CHARACTER_ABILITY,
+    19→    19→  VALID_CHARACTERS,
+    20→    20→  type AbilityId,
+    21→    21→} from "./constants";
+    22→    22→import { decideAiAnswer, pickAiChoice } from "./ai";
+    23→    23→
+    24→    24→const GAME_SECRET = process.env.GAME_SECRET ?? "";
+    25→    25→const ABANDON_GRACE_MS = 30_000;
+    26→    26→const FINISHED_ROOM_TTL_MS = 30 * 60 * 1000;
+    27→    27→
+    28→    28→interface RuntimePlayer {
+    29→    29→  pid: string;
+    30→    30→  uid: string | null;
+    31→    31→  name: string;
+    32→    32→  characterId: string;
+    33→    33→  isHost: boolean;
+    34→    34→  isAI: boolean;
+    35→    35→  aiLevel: string | null;
+    36→    36→  socketId: string | null;
+    37→    37→  connected: boolean;
+    38→    38→  ready: boolean;
+    39→    39→  score: number;
+    40→    40→  correctCount: number;
+    41→    41→  abilityUsed: boolean;
+    42→    42→  abilityArmed: AbilityId | null;
+    43→    43→  eliminated: number[] | null;
+    44→    44→  deadline: number;
+    45→    45→  answered: { choiceIndex: number; timeMs: number } | null;
+    46→    46→  readyForNext: boolean;
+    47→    47→}
+    48→    48→
+    49→    49→interface EngineQuestion {
+    50→    50→  text: string;
+    51→    51→  choices: string[];
+    52→    52→  correctIndex: number;
+    53→    53→  explanation: string;
+    54→    54→  sourceRef: string | null;
+    55→    55→}
+    56→    56→
+    57→    57→type Phase = "lobby" | "countdown" | "question" | "reveal" | "finished" | "abandoned";
+    58→    58→
+    59→    59→interface RuntimeRoom {
+    60→    60→  id: string;
+    61→    61→  code: string;
+    62→    62→  mode: "CLASH" | "PRACTICE";
+    63→    63→  quizId: string;
+    64→    64→  questionCount: number;
+    65→    65→  difficulty: string;
+    66→    66→  timerMs: number;
+    67→    67→  aiLevel: string | null;
+    68→    68→  documentName: string;
+    69→    69→  hostName: string;
+    70→    70→  phase: Phase;
+    71→    71→  players: Map<string, RuntimePlayer>;
+    72→    72→  questions: EngineQuestion[];
+    73→    73→  qIndex: number;
+    74→    74→  questionStartedAt: number;
+    75→    75→  revealEndsAt: number;
+    76→    76→  timers: Set<ReturnType<typeof setTimeout>>;
+    77→    77→  abandonTimer: ReturnType<typeof setTimeout> | null;
+    78→    78→  lastSessionId: string | null;
+    79→    79→  createdAt: number;
+    80→    80→}
+    81→    81→
+    82→    82→function log(room: string, msg: string) {
+    83→    83→  console.log(`[room ${room}] ${msg}`);
+    84→    84→}
+    85→    85→
+    86→    86→export class GameEngine {
+    87→    87→  private rooms = new Map<string, RuntimeRoom>();
+    88→    88→  private roomBuilds = new Map<string, Promise<RuntimeRoom | null>>();
+    89→    89→  private socketRoom = new Map<string, string>();
+    90→    90→
+    91→    91→  constructor(private io: Server) {
+    92→    92→    // Periodic cleanup of finished/abandoned rooms.
+    93→    93→    setInterval(() => {
+    94→    94→      const now = Date.now();
+    95→    95→      for (const [id, room] of this.rooms) {
+    96→    96→        if (
+    97→    97→          (room.phase === "finished" || room.phase === "abandoned") &&
+    98→    98→          now - room.createdAt > FINISHED_ROOM_TTL_MS &&
+    99→    99→          ![...room.players.values()].some((p) => p.socketId)
+   100→   100→        ) {
+   101→   101→          this.rooms.delete(id);
+   102→   102→        }
+   103→   103→      }
+   104→   104→    }, 5 * 60 * 1000).unref?.();
+   105→   105→  }
+   106→   106→
+   107→   107→  // ------------------------------------------------------------------ attach
+   108→   108→
+   109→   109→  /**
+   110→   110→   * Returns the runtime room, building it at most once even when several
+   111→   111→   * sockets attach concurrently (prevents duplicate-runtime races).
+   112→   112→   */
+   113→   113→  private ensureRuntime(roomId: string): Promise<RuntimeRoom | null> {
+   114→   114→    const existing = this.rooms.get(roomId);
+   115→   115→    if (existing) return Promise.resolve(existing);
+   116→   116→    let pending = this.roomBuilds.get(roomId);
+   117→   117→    if (!pending) {
+   118→   118→      pending = this.buildRuntime(roomId).catch((err) => {
+   119→   119→        console.error("buildRuntime failed", err);
+   120→   120→        return null;
+   121→   121→      });
+   122→   122→      this.roomBuilds.set(roomId, pending);
+   123→   123→      pending
+   124→   124→        .then((room) => {
+   125→   125→          if (room && !this.rooms.has(roomId)) this.rooms.set(roomId, room);
+   126→   126→        })
+   127→   127→        .catch(() => undefined)
+   128→   128→        .finally(() => {
+   129→   129→          this.roomBuilds.delete(roomId);
+   130→   130→        });
+   131→   131→    }
+   132→   132→    return pending;
+   133→   133→  }
+   134→   134→
+   135→   135→  async attachSocket(socket: Socket): Promise<void> {
+   136→   136→    const payload = verifyGameToken(socket.handshake.auth?.token, GAME_SECRET);
+   137→   137→    if (!payload) {
+   138→   138→      socket.emit("authError", { message: "Invalid or expired game token." });
+   139→   139→      socket.disconnect(true);
+   140→   140→      return;
+   141→   141→    }
+   142→   142→
+   143→   143→    const room = await this.ensureRuntime(payload.rid);
+   144→   144→    if (!room) {
+   145→   145→      socket.emit("authError", { message: "This match no longer exists." });
+   146→   146→      socket.disconnect(true);
+   147→   147→      return;
+   148→   148→    }
+   149→   149→
+   150→   150→    if (room.phase === "abandoned") {
+   151→   151→      socket.emit("abandoned", { reason: "This match was abandoned." });
+   152→   152→      socket.disconnect(true);
+   153→   153→      return;
+   154→   154→    }
+   155→   155→
+   156→   156→    const player = room.players.get(payload.pid);
+   157→   157→    if (!player || player.uid !== payload.uid) {
+   158→   158→      socket.emit("authError", { message: "You are not a participant of this match." });
+   159→   159→      socket.disconnect(true);
+   160→   160→      return;
+   161→   161→    }
+   162→   162→
+   163→   163→    // Supersede any previous socket for this participant.
+   164→   164→    if (player.socketId && player.socketId !== socket.id) {
+   165→   165→      const old = this.io.sockets.sockets.get(player.socketId);
+   166→   166→      if (old) {
+   167→   167→        old.emit("superseded", { message: "You connected from another tab." });
+   168→   168→        old.disconnect(true);
+   169→   169→        this.socketRoom.delete(player.socketId);
+   170→   170→      }
+   171→   171→    }
+   172→   172→
+   173→   173→    player.socketId = socket.id;
+   174→   174→    player.connected = true;
+   175→   175→    this.socketRoom.set(socket.id, room.id);
+   176→   176→    this.clearAbandonTimer(room);
+   177→   177→
+   178→   178→    socket.data.roomId = room.id;
+   179→   179→    socket.data.pid = player.pid;
+   180→   180→
+   181→   181→    socket.emit("hello", { serverTime: Date.now() });
+   182→   182→
+   183→   183→    // Late joiner / reconnect: catch them up.
+   184→   184→    if (room.phase === "question") {
+   185→   185→      const q = room.questions[room.qIndex];
+   186→   186→      if (q) {
+   187→   187→        socket.emit("question", {
+   188→   188→          index: room.qIndex,
+   189→   189→          total: room.questionCount,
+   190→   190→          text: q.text,
+   191→   191→          choices: q.choices,
+   192→   192→          difficulty: room.difficulty,
+   193→   193→          timerMs: room.timerMs,
+   194→   194→          endsAt: player.deadline,
+   195→   195→          serverTime: Date.now(),
+   196→   196→          youAnswered: player.answered?.choiceIndex ?? null,
+   197→   197→          eliminated: player.eliminated,
+   198→   198→        });
+   199→   199→      }
+   200→   200→    }
+   201→   201→    if (room.phase === "reveal") {
+   202→   202→      // The reveal payload is broadcast on lock; a reconnecting player gets
+   203→   203→      // roomState and will see scores on the next question. Send a compact
+   204→   204→      // catch-up so they are not stuck on a blank screen.
+   205→   205→      socket.emit("revealCatchup", { index: room.qIndex, nextAt: room.revealEndsAt });
+   206→   206→    }
+   207→   207→    if (room.phase === "finished" && room.lastSessionId) {
+   208→   208→      await this.emitReconstructedGameOver(room, socket);
+   209→   209→    }
+   210→   210→
+   211→   211→    this.broadcastRoomState(room);
+   212→   212→    log(room.code, `player ${player.name} attached (${room.phase})`);
+   213→   213→  }
+   214→   214→
+   215→   215→  detachSocket(socket: Socket) {
+   216→   216→    const roomId = this.socketRoom.get(socket.id);
+   217→   217→    if (!roomId) return;
+   218→   218→    this.socketRoom.delete(socket.id);
+   219→   219→    const room = this.rooms.get(roomId);
+   220→   220→    if (!room) return;
+   221→   221→    const player = [...room.players.values()].find((p) => p.socketId === socket.id);
+   222→   222→    if (!player) return;
+   223→   223→    player.socketId = null;
+   224→   224→    player.connected = false;
+   225→   225→
+   226→   226→    if (room.phase === "lobby") {
+   227→   227→      if (player.isHost) {
+   228→   228→        this.startAbandonTimer(room, "The host left the lobby.");
+   229→   229→      } else {
+   230→   230→        // Guests can cleanly leave a lobby (history is denormalized).
+   231→   231→        room.players.delete(player.pid);
+   232→   232→        db.gameParticipant
+   233→   233→          .delete({ where: { id: player.pid } })
+   234→   234→          .catch(() => undefined);
+   235→   235→        this.broadcast(room, "playerLeft", { pid: player.pid, name: player.name });
+   236→   236→        const humans = [...room.players.values()].filter((p) => !p.isAI);
+   237→   237→        if (humans.length === 0) {
+   238→   238→          this.abandon(room, "Everyone left the lobby.");
+   239→   239→        }
+   240→   240→      }
+   241→   241→    } else if (room.phase === "countdown" || room.phase === "question" || room.phase === "reveal") {
+   242→   242→      this.broadcast(room, "playerLeft", { pid: player.pid, name: player.name });
+   243→   243→      this.startAbandonTimer(room, `${player.name} disconnected.`);
+   244→   244→    }
+   245→   245→    this.broadcastRoomState(room);
+   246→   246→    log(room.code, `player ${player.name} detached (${room.phase})`);
+   247→   247→  }
+   248→   248→
+   249→   249→  // ------------------------------------------------------------- runtime ops
+   250→   250→
+   251→   251→  private async buildRuntime(roomId: string): Promise<RuntimeRoom | null> {
+   252→   252→    const room = await db.gameRoom.findUnique({
+   253→   253→      where: { id: roomId },
+   254→   254→      include: {
+   255→   255→        quiz: { include: { document: { select: { fileName: true } } } },
+   256→   256→        host: { select: { username: true } },
+   257→   257→        participants: true,
+   258→   258→      },
+   259→   259→    });
+   260→   260→    if (!room) return null;
+   261→   261→
+   262→   262→    let phase: Phase = "lobby";
+   263→   263→    if (room.status === "finished") phase = "finished";
+   264→   264→    if (room.status === "abandoned") phase = "abandoned";
+   265→   265→    // If the service restarted mid-match, that match is over.
+   266→   266→    if (room.status === "playing") {
+   267→   267→      phase = "abandoned";
+   268→   268→      await db.gameRoom
+   269→   269→        .update({ where: { id: room.id }, data: { status: "abandoned", endedAt: new Date() } })
+   270→   270→        .catch(() => undefined);
+   271→   271→    }
+   272→   272→
+   273→   273→    const runtime: RuntimeRoom = {
+   274→   274→      id: room.id,
+   275→   275→      code: room.code,
+   276→   276→      mode: room.mode as "CLASH" | "PRACTICE",
+   277→   277→      quizId: room.quizId,
+   278→   278→      questionCount: room.questionCount,
+   279→   279→      difficulty: room.difficulty,
+   280→   280→      timerMs: room.timerSeconds * 1000,
+   281→   281→      aiLevel: room.aiLevel,
+   282→   282→      documentName: room.quiz.document.fileName,
+   283→   283→      hostName: room.host.username,
+   284→   284→      phase,
+   285→   285→      players: new Map(),
+   286→   286→      questions: [],
+   287→   287→      qIndex: 0,
+   288→   288→      questionStartedAt: 0,
+   289→   289→      revealEndsAt: 0,
+   290→   290→      timers: new Set(),
+   291→   291→      abandonTimer: null,
+   292→   292→      lastSessionId: null,
+   293→   293→      createdAt: Date.now(),
+   294→   294→    };
+   295→   295→
+   296→   296→    for (const p of room.participants) {
+   297→   297→      runtime.players.set(p.id, {
+   298→   298→        pid: p.id,
+   299→   299→        uid: p.userId,
+   300→   300→        name: p.displayName,
+   301→   301→        characterId: p.characterId,
+   302→   302→        isHost: p.isHost,
+   303→   303→        isAI: p.isAI,
+   304→   304→        aiLevel: p.aiLevel,
+   305→   305→        socketId: null,
+   306→   306→        connected: false,
+   307→   307→        ready: p.ready,
+   308→   308→        score: p.score,
+   309→   309→        correctCount: p.correctCount,
+   310→   310→        abilityUsed: p.abilityUsed,
+   311→   311→        abilityArmed: (p.abilityActive as AbilityId | null) ?? null,
+   312→   312→        eliminated: null,
+   313→   313→        deadline: 0,
+   314→   314→        answered: null,
+   315→   315→        readyForNext: false,
+   316→   316→      });
+   317→   317→    }
+   318→   318→
+   319→   319→    if (phase === "finished") {
+   320→   320→      const session = await db.gameSession.findFirst({
+   321→   321→        where: { roomId: room.id },
+   322→   322→        orderBy: { finishedAt: "desc" },
+   323→   323→      });
+   324→   324→      runtime.lastSessionId = session?.id ?? null;
+   325→   325→      await this.loadQuestions(runtime);
+   326→   326→    }
+   327→   327→
+   328→   328→    return runtime;
+   329→   329→  }
+   330→   330→
+   331→   331→  private async loadQuestions(room: RuntimeRoom): Promise<boolean> {
+   332→   332→    const rows = await db.question.findMany({
+   333→   333→      where: { quizId: room.quizId },
+   334→   334→      orderBy: { order: "asc" },
+   335→   335→    });
+   336→   336→    room.questions = rows.map((q) => ({
+   337→   337→      text: q.text,
+   338→   338→      choices: JSON.parse(q.choices) as string[],
+   339→   339→      correctIndex: q.correctIndex,
+   340→   340→      explanation: q.explanation,
+   341→   341→      sourceRef: q.sourceRef,
+   342→   342→    }));
+   343→   343→    return room.questions.length >= room.questionCount;
+   344→   344→  }
+   345→   345→
+   346→   346→  // -------------------------------------------------------------- broadcasts
+   347→   347→
+   348→   348→  private broadcast(room: RuntimeRoom, event: string, payload: unknown) {
+   349→   349→    for (const p of room.players.values()) {
+   350→   350→      if (p.socketId) this.io.to(p.socketId).emit(event, payload);
+   351→   351→    }
+   352→   352→  }
+   353→   353→
+   354→   354→  private emitTo(room: RuntimeRoom, pid: string, event: string, payload: unknown) {
+   355→   355→    const p = room.players.get(pid);
+   356→   356→    if (p?.socketId) this.io.to(p.socketId).emit(event, payload);
+   357→   357→  }
+   358→   358→
+   359→   359→  private emitOthers(room: RuntimeRoom, pid: string, event: string, payload: unknown) {
+   360→   360→    for (const p of room.players.values()) {
+   361→   361→      if (p.pid !== pid && p.socketId) this.io.to(p.socketId).emit(event, payload);
+   362→   362→    }
+   363→   363→  }
+   364→   364→
+   365→   365→  private roomInfo(room: RuntimeRoom) {
+   366→   366→    return {
+   367→   367→      code: room.code,
+   368→   368→      mode: room.mode,
+   369→   369→      status: room.phase === "abandoned" ? "abandoned" : room.phase === "finished" ? "finished" : room.phase === "lobby" ? "lobby" : "playing",
+   370→   370→      questionCount: room.questionCount,
+   371→   371→      difficulty: room.difficulty,
+   372→   372→      timerSeconds: room.timerMs / 1000,
+   373→   373→      aiLevel: room.aiLevel,
+   374→   374→      documentName: room.documentName,
+   375→   375→      hostName: room.hostName,
+   376→   376→    };
+   377→   377→  }
+   378→   378→
+   379→   379→  private playerPublic(p: RuntimePlayer) {
+   380→   380→    return {
+   381→   381→      pid: p.pid,
+   382→   382→      name: p.name,
+   383→   383→      characterId: p.characterId,
+   384→   384→      isHost: p.isHost,
+   385→   385→      isAI: p.isAI,
+   386→   386→      aiLevel: p.aiLevel,
+   387→   387→      score: p.score,
+   388→   388→      ready: p.ready,
+   389→   389→      abilityUsed: p.abilityUsed,
+   390→   390→      abilityArmed: p.abilityArmed,
+   391→   391→      connected: p.connected,
+   392→   392→      submitted: p.answered !== null,
+   393→   393→    };
+   394→   394→  }
+   395→   395→
+   396→   396→  private broadcastRoomState(room: RuntimeRoom) {
+   397→   397→    for (const p of room.players.values()) {
+   398→   398→      if (!p.socketId) continue;
+   399→   399→      this.io.to(p.socketId).emit("roomState", {
+   400→   400→        room: this.roomInfo(room),
+   401→   401→        phase: room.phase,
+   402→   402→        players: [...room.players.values()].map((x) => this.playerPublic(x)),
+   403→   403→        you: { pid: p.pid, isHost: p.isHost },
+   404→   404→        qIndex: room.qIndex,
+   405→   405→      });
+   406→   406→    }
+   407→   407→  }
+   408→   408→
+   409→   409→  // ------------------------------------------------------------------ timers
+   410→   410→
+   411→   411→  private addTimer(room: RuntimeRoom, t: ReturnType<typeof setTimeout>) {
+   412→   412→    room.timers.add(t);
+   413→   413→  }
+   414→   414→
+   415→   415→  private clearTimers(room: RuntimeRoom) {
+   416→   416→    for (const t of room.timers) clearTimeout(t);
+   417→   417→    room.timers.clear();
+   418→   418→  }
+   419→   419→
+   420→   420→  private startAbandonTimer(room: RuntimeRoom, reason: string) {
+   421→   421→    if (room.abandonTimer) clearTimeout(room.abandonTimer);
+   422→   422→    room.abandonTimer = setTimeout(() => {
+   423→   423→      room.abandonTimer = null;
+   424→   424→      this.abandon(room, reason);
+   425→   425→    }, ABANDON_GRACE_MS);
+   426→   426→  }
+   427→   427→
+   428→   428→  private clearAbandonTimer(room: RuntimeRoom) {
+   429→   429→    if (room.abandonTimer) {
+   430→   430→      clearTimeout(room.abandonTimer);
+   431→   431→      room.abandonTimer = null;
+   432→   432→    }
+   433→   433→  }
+   434→   434→
+   435→   435→  private abandon(room: RuntimeRoom, reason: string) {
+   436→   436→    if (room.phase === "finished" || room.phase === "abandoned") return;
+   437→   437→    this.clearTimers(room);
+   438→   438→    this.clearAbandonTimer(room);
+   439→   439→    room.phase = "abandoned";
+   440→   440→    this.broadcast(room, "abandoned", { reason });
+   441→   441→    this.broadcastRoomState(room);
+   442→   442→    db.gameRoom
+   443→   443→      .update({ where: { id: room.id }, data: { status: "abandoned", endedAt: new Date() } })
+   444→   444→      .catch((e) => console.error("abandon db error", e));
+   445→   445→    log(room.code, `abandoned: ${reason}`);
+   446→   446→  }
+   447→   447→
+   448→   448→  // ------------------------------------------------------------ event layer
+   449→   449→
+   450→   450→  private ctx(socket: Socket): { room: RuntimeRoom; player: RuntimePlayer } | null {
+   451→   451→    const roomId = socket.data.roomId as string | undefined;
+   452→   452→    const pid = socket.data.pid as string | undefined;
+   453→   453→    if (!roomId || !pid) return null;
+   454→   454→    const room = this.rooms.get(roomId);
+   455→   455→    if (!room) return null;
+   456→   456→    const player = room.players.get(pid);
+   457→   457→    if (!player) return null;
+   458→   458→    return { room, player };
+   459→   459→  }
+   460→   460→
+   461→   461→  handleSync(socket: Socket) {
+   462→   462→    const ctx = this.ctx(socket);
+   463→   463→    if (!ctx) return;
+   464→   464→    const { room, player } = ctx;
+   465→   465→    if (player.socketId) {
+   466→   466→      this.io.to(player.socketId).emit("roomState", {
+   467→   467→        room: this.roomInfo(room),
+   468→   468→        phase: room.phase,
+   469→   469→        players: [...room.players.values()].map((x) => this.playerPublic(x)),
+   470→   470→        you: { pid: player.pid, isHost: player.isHost },
+   471→   471→        qIndex: room.qIndex,
+   472→   472→      });
+   473→   473→    }
+   474→   474→  }
+   475→   475→
+   476→   476→  handleCharacter(socket: Socket, data: { characterId?: string }) {
+   477→   477→    const ctx = this.ctx(socket);
+   478→   478→    if (!ctx) return;
+   479→   479→    const { room, player } = ctx;
+   480→   480→    const characterId = String(data?.characterId ?? "");
+   481→   481→    if (!VALID_CHARACTERS.includes(characterId)) {
+   482→   482→      this.emitTo(room, player.pid, "error", { message: "Unknown character." });
+   483→   483→      return;
+   484→   484→    }
+   485→   485→    if (room.phase !== "lobby" && room.phase !== "finished") {
+   486→   486→      this.emitTo(room, player.pid, "error", { message: "Characters are locked once the match starts." });
+   487→   487→      return;
+   488→   488→    }
+   489→   489→    player.characterId = characterId;
+   490→   490→    player.abilityUsed = false; // fresh ability with a fresh character before start
+   491→   491→    player.abilityArmed = null;
+   492→   492→    db.gameParticipant
+   493→   493→      .update({ where: { id: player.pid }, data: { characterId, abilityUsed: false, abilityActive: null } })
+   494→   494→      .catch(() => undefined);
+   495→   495→    this.broadcastRoomState(room);
+   496→   496→  }
+   497→   497→
+   498→   498→  handleReady(socket: Socket, data: { value?: boolean }) {
+   499→   499→    const ctx = this.ctx(socket);
+   500→   500→    if (!ctx) return;
+   501→   501→    const { room, player } = ctx;
+   502→   502→    if (room.phase !== "lobby") {
+   503→   503→      this.emitTo(room, player.pid, "error", { message: "The match is not in the lobby." });
+   504→   504→      return;
+   505→   505→    }
+   506→   506→    player.ready = Boolean(data?.value);
+   507→   507→    db.gameParticipant.update({ where: { id: player.pid }, data: { ready: player.ready } }).catch(() => undefined);
+   508→   508→    this.broadcastRoomState(room);
+   509→   509→  }
+   510→   510→
+   511→   511→  async handleStart(socket: Socket) {
+   512→   512→    const ctx = this.ctx(socket);
+   513→   513→    if (!ctx) return;
+   514→   514→    const { room, player } = ctx;
+   515→   515→    if (!player.isHost) {
+   516→   516→      this.emitTo(room, player.pid, "error", { message: "Only the host can start the match." });
+   517→   517→      return;
+   518→   518→    }
+   519→   519→    if (room.phase !== "lobby") {
+   520→   520→      this.emitTo(room, player.pid, "error", { message: "The match has already started." });
+   521→   521→      return;
+   522→   522→    }
+   523→   523→    const humans = [...room.players.values()].filter((p) => !p.isAI);
+   524→   524→    if (humans.some((p) => !p.ready)) {
+   525→   525→      this.emitTo(room, player.pid, "error", { message: "All players must be ready first." });
+   526→   526→      return;
+   527→   527→    }
+   528→   528→    if (room.mode === "CLASH" && humans.length < 2) {
+   529→   529→      this.emitTo(room, player.pid, "error", { message: "Waiting for an opponent to join the room." });
+   530→   530→      return;
+   531→   531→    }
+   532→   532→
+   533→   533→    if (room.questions.length === 0) {
+   534→   534→      const ok = await this.loadQuestions(room);
+   535→   535→      if (!ok) {
+   536→   536→        this.emitTo(room, player.pid, "error", { message: "Quiz questions could not be loaded." });
+   537→   537→        return;
+   538→   538→      }
+   539→   539→    }
+   540→   540→
+   541→   541→    // Full reset (covers both fresh starts and rematches).
+   542→   542→    for (const p of room.players.values()) {
+   543→   543→      p.score = 0;
+   544→   544→      p.correctCount = 0;
+   545→   545→      p.ready = false;
+   546→   546→      p.abilityUsed = false;
+   547→   547→      p.abilityArmed = null;
+   548→   548→      p.answered = null;
+   549→   549→      p.eliminated = null;
+   550→   550→      p.readyForNext = false;
+   551→   551→    }
+   552→   552→    room.qIndex = 0;
+   553→   553→    await db.gameParticipant.updateMany({
+   554→   554→      where: { roomId: room.id },
+   555→   555→      data: { score: 0, correctCount: 0, ready: false, abilityUsed: false, abilityActive: null },
+   556→   556→    }).catch(() => undefined);
+   557→   557→    await db.gameRoom.update({ where: { id: room.id }, data: { status: "playing" } }).catch(() => undefined);
+   558→   558→    await db.playerAnswer.deleteMany({
+   559→   559→      where: { participant: { roomId: room.id } },
+   560→   560→    }).catch(() => undefined);
+   561→   561→
+   562→   562→    this.runCountdown(room);
+   563→   563→  }
+   564→   564→
+   565→   565→  private runCountdown(room: RuntimeRoom) {
+   566→   566→    this.clearTimers(room);
+   567→   567→    this.clearAbandonTimer(room);
+   568→   568→    room.phase = "countdown";
+   569→   569→    this.broadcastRoomState(room);
+   570→   570→    let n = COUNTDOWN_SECONDS;
+   571→   571→    const tick = () => {
+   572→   572→      this.broadcast(room, "countdown", { value: n });
+   573→   573→      n -= 1;
+   574→   574→      if (n >= 1) {
+   575→   575→        this.addTimer(room, setTimeout(tick, 1000));
+   576→   576→      } else {
+   577→   577→        this.addTimer(room, setTimeout(() => this.startQuestion(room, 0), 1000));
+   578→   578→      }
+   579→   579→    };
+   580→   580→    tick();
+   581→   581→  }
+   582→   582→
+   583→   583→  // -------------------------------------------------------------- questions
+   584→   584→
+   585→   585→  private startQuestion(room: RuntimeRoom, index: number) {
+   586→   586→    const q = room.questions[index];
+   587→   587→    if (!q) {
+   588→   588→      this.abandon(room, "Quiz data missing.");
+   589→   589→      return;
+   590→   590→    }
+   591→   591→    this.clearTimers(room);
+   592→   592→    room.phase = "question";
+   593→   593→    room.qIndex = index;
+   594→   594→    room.questionStartedAt = Date.now();
+   595→   595→
+   596→   596→    for (const p of room.players.values()) {
+   597→   597→      p.answered = null;
+   598→   598→      p.eliminated = null;
+   599→   599→      p.readyForNext = false;
+   600→   600→      p.deadline = room.questionStartedAt + room.timerMs;
+   601→   601→    }
+   602→   602→
+   603→   603→    this.broadcastRoomState(room);
+   604→   604→
+   605→   605→    for (const p of room.players.values()) {
+   606→   606→      if (p.isAI) {
+   607→   607→        this.scheduleAi(room, p, q, index);
+   608→   608→      } else if (p.socketId) {
+   609→   609→        this.io.to(p.socketId).emit("question", {
+   610→   610→          index,
+   611→   611→          total: room.questionCount,
+   612→   612→          text: q.text,
+   613→   613→          choices: q.choices,
+   614→   614→          difficulty: room.difficulty,
+   615→   615→          timerMs: room.timerMs,
+   616→   616→          endsAt: p.deadline,
+   617→   617→          serverTime: Date.now(),
+   618→   618→          youAnswered: null,
+   619→   619→          eliminated: null,
+   620→   620→        });
+   621→   621→      }
+   622→   622→    }
+   623→   623→
+   624→   624→    this.addTimer(
+   625→   625→      room,
+   626→   626→      setTimeout(() => this.attemptLock(room), room.timerMs + 250)
+   627→   627→    );
+   628→   628→    log(room.code, `question ${index + 1}/${room.questionCount} started`);
+   629→   629→  }
+   630→   630→
+   631→   631→  private scheduleAi(room: RuntimeRoom, bot: RuntimePlayer, q: EngineQuestion, index: number) {
+   632→   632→    const decision = decideAiAnswer(bot.aiLevel ?? "MID", room.difficulty, room.timerMs);
+   633→   633→    const delay = Math.min(decision.delayMs, room.timerMs + 600);
+   634→   634→    this.addTimer(
+   635→   635→      room,
+   636→   636→      setTimeout(() => {
+   637→   637→        if (room.phase !== "question" || room.qIndex !== index) return;
+   638→   638→        if (bot.answered) return;
+   639→   639→        const choiceIndex = pickAiChoice(decision.correct, q.correctIndex);
+   640→   640→        this.submitAnswer(room, bot, choiceIndex);
+   641→   641→      }, delay)
+   642→   642→    );
+   643→   643→  }
+   644→   644→
+   645→   645→  handleSubmit(socket: Socket, data: { index?: number; choiceIndex?: number }) {
+   646→   646→    const ctx = this.ctx(socket);
+   647→   647→    if (!ctx) return;
+   648→   648→    const { room, player } = ctx;
+   649→   649→    if (room.phase !== "question" || room.qIndex !== Number(data?.index)) {
+   650→   650→      this.emitTo(room, player.pid, "answerRejected", { reason: "Question is no longer active." });
+   651→   651→      return;
+   652→   652→    }
+   653→   653→    const choiceIndex = Number(data?.choiceIndex);
+   654→   654→    if (!Number.isInteger(choiceIndex) || choiceIndex < 0 || choiceIndex > 3) {
+   655→   655→      this.emitTo(room, player.pid, "answerRejected", { reason: "Invalid choice." });
+   656→   656→      return;
+   657→   657→    }
+   658→   658→    const accepted = this.submitAnswer(room, player, choiceIndex);
+   659→   659→    if (!accepted) {
+   660→   660→      this.emitTo(room, player.pid, "answerRejected", { reason: "Answer already locked or time is up." });
+   661→   661→    }
+   662→   662→  }
+   663→   663→
+   664→   664→  private submitAnswer(room: RuntimeRoom, player: RuntimePlayer, choiceIndex: number): boolean {
+   665→   665→    if (room.phase !== "question") return false;
+   666→   666→    if (player.answered) return false; // duplicate submission
+   667→   667→    if (Date.now() > player.deadline) return false; // expired for this player
+   668→   668→    if (player.eliminated && player.eliminated.includes(choiceIndex)) return false;
+   669→   669→
+   670→   670→    const timeMs = Math.max(0, Date.now() - room.questionStartedAt);
+   671→   671→    player.answered = { choiceIndex, timeMs };
+   672→   672→    player.readyForNext = false;
+   673→   673→
+   674→   674→    this.emitTo(room, player.pid, "answerAccepted", { index: room.qIndex, choiceIndex });
+   675→   675→    this.emitOthers(room, player.pid, "opponentAnswered", { pid: player.pid, index: room.qIndex });
+   676→   676→    log(room.code, `${player.name} answered q${room.qIndex + 1} (${timeMs}ms)`);
+   677→   677→    this.attemptLock(room);
+   678→   678→    return true;
+   679→   679→  }
+   680→   680→
+   681→   681→  /** Lock the round once every player has answered or their deadline passed. */
+   682→   682→  private attemptLock(room: RuntimeRoom) {
+   683→   683→    if (room.phase !== "question") return;
+   684→   684→    const now = Date.now();
+   685→   685→    const pending = [...room.players.values()].filter((p) => !p.answered && p.deadline > now);
+   686→   686→    if (pending.length > 0) {
+   687→   687→      const next = Math.min(...pending.map((p) => p.deadline));
+   688→   688→      this.addTimer(room, setTimeout(() => this.attemptLock(room), Math.max(60, next - Date.now() + 200)));
+   689→   689→      return;
+   690→   690→    }
+   691→   691→    this.lockRound(room);
+   692→   692→  }
+   693→   693→
+   694→   694→  private lockRound(room: RuntimeRoom) {
+   695→   695→    if (room.phase !== "question") return;
+   696→   696→    room.phase = "reveal";
+   697→   697→    this.clearTimers(room);
+   698→   698→
+   699→   699→    const q = room.questions[room.qIndex];
+   700→   700→    const results: Array<Record<string, unknown>> = [];
+   701→   701→
+   702→   702→    for (const p of room.players.values()) {
+   703→   703→      const answered = p.answered;
+   704→   704→      const choiceIndex = answered?.choiceIndex ?? null;
+   705→   705→      const correct = choiceIndex !== null && choiceIndex === q.correctIndex;
+   706→   706→      const armed = p.abilityArmed;
+   707→   707→      const timeMs = answered ? answered.timeMs : room.timerMs;
+   708→   708→      const score = computeQuestionScore({
+   709→   709→        correct,
+   710→   710→        timeMs,
+   711→   711→        timerMs: room.timerMs,
+   712→   712→        armedAbility: armed,
+   713→   713→      });
+   714→   714→      p.abilityArmed = null;
+   715→   715→      if (correct) {
+   716→   716→        p.score += score.total;
+   717→   717→        p.correctCount += 1;
+   718→   718→      }
+   719→   719→      results.push({
+   720→   720→        pid: p.pid,
+   721→   721→        name: p.name,
+   722→   722→        choiceIndex,
+   723→   723→        correct,
+   724→   724→        points: score.total,
+   725→   725→        base: score.base,
+   726→   726→        speedBonus: score.speedBonus,
+   727→   727→        abilityBonus: score.abilityBonus,
+   728→   728→        timeMs,
+   729→   729→      });
+   730→   730→
+   731→   731→      // Persist (server-authoritative record of every answer).
+   732→   732→      db.playerAnswer
+   733→   733→        .upsert({
+   734→   734→          where: { participantId_questionIndex: { participantId: p.pid, questionIndex: room.qIndex } },
+   735→   735→          create: {
+   736→   736→            participantId: p.pid,
+   737→   737→            questionIndex: room.qIndex,
+   738→   738→            choiceIndex,
+   739→   739→            timeMs,
+   740→   740→            correct,
+   741→   741→            points: score.total,
+   742→   742→            abilityBonus: score.abilityBonus,
+   743→   743→          },
+   744→   744→          update: { choiceIndex, timeMs, correct, points: score.total, abilityBonus: score.abilityBonus },
+   745→   745→        })
+   746→   746→        .catch((e) => console.error("answer persist error", e));
+   747→   747→      db.gameParticipant
+   748→   748→        .update({ where: { id: p.pid }, data: { score: p.score, correctCount: p.correctCount, abilityActive: null } })
+   749→   749→        .catch(() => undefined);
+   750→   750→    }
+   751→   751→
+   752→   752→    room.revealEndsAt = Date.now() + REVEAL_SECONDS * 1000;
+   753→   753→    // Answer key is only revealed AFTER the round is locked. The question text
+   754→   754→    // and choices are already public (both players just saw them).
+   755→   755→    this.broadcast(room, "roundResult", {
+   756→   756→      index: room.qIndex,
+   757→   757→      text: q.text,
+   758→   758→      choices: q.choices,
+   759→   759→      correctIndex: q.correctIndex,
+   760→   760→      explanation: q.explanation,
+   761→   761→      sourceRef: q.sourceRef,
+   762→   762→      results,
+   763→   763→      scores: [...room.players.values()].map((p) => ({ pid: p.pid, score: p.score })),
+   764→   764→      nextAt: room.revealEndsAt,
+   765→   765→    });
+   766→   766→    this.broadcastRoomState(room);
+   767→   767→    this.addTimer(room, setTimeout(() => this.advance(room), REVEAL_SECONDS * 1000));
+   768→   768→    log(room.code, `round ${room.qIndex + 1} locked`);
+   769→   769→  }
+   770→   770→
+   771→   771→  handleNext(socket: Socket) {
+   772→   772→    const ctx = this.ctx(socket);
+   773→   773→    if (!ctx) return;
+   774→   774→    const { room, player } = ctx;
+   775→   775→    if (room.phase !== "reveal") return;
+   776→   776→    player.readyForNext = true;
+   777→   777→    const deciders = [...room.players.values()].filter((p) => !p.isAI && p.connected);
+   778→   778→    if (deciders.length > 0 && deciders.every((p) => p.readyForNext)) {
+   779→   779→      this.clearTimers(room);
+   780→   780→      this.advance(room);
+   781→   781→    }
+   782→   782→  }
+   783→   783→
+   784→   784→  private advance(room: RuntimeRoom) {
+   785→   785→    if (room.phase !== "reveal") return;
+   786→   786→    if (room.qIndex + 1 < room.questionCount) {
+   787→   787→      this.startQuestion(room, room.qIndex + 1);
+   788→   788→    } else {
+   789→   789→      void this.finishGame(room);
+   790→   790→    }
+   791→   791→  }
+   792→   792→
+   793→   793→  // ----------------------------------------------------------------- results
+   794→   794→
+   795→   795→  private async finishGame(room: RuntimeRoom) {
+   796→   796→    if (room.phase === "finished") return;
+   797→   797→    this.clearTimers(room);
+   798→   798→    this.clearAbandonTimer(room);
+   799→   799→    room.phase = "finished";
+   800→   800→
+   801→   801→    const players = [...room.players.values()];
+   802→   802→    const pids = players.map((p) => p.pid);
+   803→   803→    const answers = await db.playerAnswer.findMany({ where: { participantId: { in: pids } } });
+   804→   804→
+   805→   805→    const maxScore = Math.max(...players.map((p) => p.score), 0);
+   806→   806→    const topCount = players.filter((p) => p.score === maxScore && maxScore > 0).length;
+   807→   807→
+   808→   808→    const session = await db.gameSession.create({
+   809→   809→      data: {
+   810→   810→        roomId: room.id,
+   811→   811→        mode: room.mode,
+   812→   812→        questionCount: room.questionCount,
+   813→   813→        difficulty: room.difficulty,
+   814→   814→        timerSeconds: room.timerMs / 1000,
+   815→   815→      },
+   816→   816→    });
+   817→   817→    room.lastSessionId = session.id;
+   818→   818→
+   819→   819→    const finalResults: Array<Record<string, unknown>> = [];
+   820→   820→    for (const p of players) {
+   821→   821→      const mine = answers.filter((a) => a.participantId === p.pid);
+   822→   822→      const avgTimeMs = mine.length
+   823→   823→        ? Math.round(mine.reduce((s, a) => s + a.timeMs, 0) / mine.length)
+   824→   824→        : room.timerMs;
+   825→   825→      const won = maxScore > 0 && p.score === maxScore && topCount === 1;
+   826→   826→      finalResults.push({
+   827→   827→        pid: p.pid,
+   828→   828→        name: p.name,
+   829→   829→        characterId: p.characterId,
+   830→   830→        isAI: p.isAI,
+   831→   831→        aiLevel: p.aiLevel,
+   832→   832→        score: p.score,
+   833→   833→        correctCount: p.correctCount,
+   834→   834→        totalQuestions: room.questionCount,
+   835→   835→        accuracy: room.questionCount ? p.correctCount / room.questionCount : 0,
+   836→   836→        avgTimeMs,
+   837→   837→        abilityUsed: p.abilityUsed,
+   838→   838→        won,
+   839→   839→      });
+   840→   840→      await db.playerResult.create({
+   841→   841→        data: {
+   842→   842→          sessionId: session.id,
+   843→   843→          participantId: p.pid,
+   844→   844→          userId: p.uid,
+   845→   845→          displayName: p.name,
+   846→   846→          characterId: p.characterId,
+   847→   847→          isAI: p.isAI,
+   848→   848→          aiLevel: p.aiLevel,
+   849→   849→          score: p.score,
+   850→   850→          correctCount: p.correctCount,
+   851→   851→          totalQuestions: room.questionCount,
+   852→   852→          accuracy: room.questionCount ? p.correctCount / room.questionCount : 0,
+   853→   853→          avgTimeMs,
+   854→   854→          abilityUsed: p.abilityUsed,
+   855→   855→          won,
+   856→   856→        },
+   857→   857→      });
+   858→   858→      await db.gameParticipant
+   859→   859→        .update({ where: { id: p.pid }, data: { score: p.score, correctCount: p.correctCount, ready: false } })
+   860→   860→        .catch(() => undefined);
+   861→   861→    }
+   862→   862→
+   863→   863→    await db.gameRoom
+   864→   864→      .update({ where: { id: room.id }, data: { status: "finished", endedAt: new Date() } })
+   865→   865→      .catch(() => undefined);
+   866→   866→
+   867→   867→    // Full review — the game is over, so revealing the answer key is allowed.
+   868→   868→    const review = room.questions.map((q, i) => ({
+   869→   869→      index: i,
+   870→   870→      text: q.text,
+   871→   871→      choices: q.choices,
+   872→   872→      correctIndex: q.correctIndex,
+   873→   873→      explanation: q.explanation,
+   874→   874→      sourceRef: q.sourceRef,
+   875→   875→      answers: players.map((p) => {
+   876→   876→        const a = answers.find((x) => x.participantId === p.pid && x.questionIndex === i);
+   877→   877→        return {
+   878→   878→          pid: p.pid,
+   879→   879→          name: p.name,
+   880→   880→          choiceIndex: a?.choiceIndex ?? null,
+   881→   881→          correct: a?.correct ?? false,
+   882→   882→          points: a?.points ?? 0,
+   883→   883→        };
+   884→   884→      }),
+   885→   885→    }));
+   886→   886→
+   887→   887→    this.broadcast(room, "gameOver", {
+   888→   888→      mode: room.mode,
+   889→   889→      results: finalResults,
+   890→   890→      review,
+   891→   891→      sessionId: session.id,
+   892→   892→    });
+   893→   893→    this.broadcastRoomState(room);
+   894→   894→    log(room.code, "match finished");
+   895→   895→  }
+   896→   896→
+   897→   897→  private async emitReconstructedGameOver(room: RuntimeRoom, socket: Socket) {
+   898→   898→    const sessionId = room.lastSessionId;
+   899→   899→    if (!sessionId) return;
+   900→   900→    const session = await db.gameSession.findUnique({ where: { id: sessionId } });
+   901→   901→    if (!session) return;
+   902→   902→    const results = await db.playerResult.findMany({ where: { sessionId } });
+   903→   903→    const pids = results.map((r) => r.participantId);
+   904→   904→    const answers = await db.playerAnswer.findMany({
+   905→   905→      where: { participantId: { in: pids } },
+   906→   906→      orderBy: { questionIndex: "asc" },
+   907→   907→    });
+   908→   908→    const review = room.questions.map((q, i) => ({
+   909→   909→      index: i,
+   910→   910→      text: q.text,
+   911→   911→      choices: q.choices,
+   912→   912→      correctIndex: q.correctIndex,
+   913→   913→      explanation: q.explanation,
+   914→   914→      sourceRef: q.sourceRef,
+   915→   915→      answers: results.map((r) => {
+   916→   916→        const a = answers.find((x) => x.participantId === r.participantId && x.questionIndex === i);
+   917→   917→        return {
+   918→   918→          pid: r.participantId,
+   919→   919→          name: r.displayName,
+   920→   920→          choiceIndex: a?.choiceIndex ?? null,
+   921→   921→          correct: a?.correct ?? false,
+   922→   922→          points: a?.points ?? 0,
+   923→   923→        };
+   924→   924→      }),
+   925→   925→    }));
+   926→   926→    socket.emit("gameOver", {
+   927→   927→      mode: session.mode,
+   928→   928→      results: results.map((r) => ({
+   929→   929→        pid: r.participantId,
+   930→   930→        name: r.displayName,
+   931→   931→        characterId: r.characterId,
+   932→   932→        isAI: r.isAI,
+   933→   933→        aiLevel: r.aiLevel,
+   934→   934→        score: r.score,
+   935→   935→        correctCount: r.correctCount,
+   936→   936→        totalQuestions: r.totalQuestions,
+   937→   937→        accuracy: r.accuracy,
+   938→   938→        avgTimeMs: r.avgTimeMs,
+   939→   939→        abilityUsed: r.abilityUsed,
+   940→   940→        won: r.won,
+   941→   941→      })),
+   942→   942→      review,
+   943→   943→      sessionId: session.id,
+   944→   944→    });
+   945→   945→  }
+   946→   946→
+   947→   947→  // ----------------------------------------------------------------- rematch
+   948→   948→
+   949→   949→  async handleRematch(socket: Socket) {
+   950→   950→    const ctx = this.ctx(socket);
+   951→   951→    if (!ctx) return;
+   952→   952→    const { room, player } = ctx;
+   953→   953→    if (!player.isHost) {
+   954→   954→      this.emitTo(room, player.pid, "error", { message: "Only the host can start a rematch." });
+   955→   955→      return;
+   956→   956→    }
+   957→   957→    if (room.phase !== "finished") {
+   958→   958→      this.emitTo(room, player.pid, "error", { message: "Rematch is only available after a match ends." });
+   959→   959→      return;
+   960→   960→    }
+   961→   961→    // Clear transient answers and reset participants for the rematch.
+   962→   962→    await db.playerAnswer.deleteMany({
+   963→   963→      where: { participant: { roomId: room.id } },
+   964→   964→    }).catch(() => undefined);
+   965→   965→    await db.gameParticipant
+   966→   966→      .updateMany({
+   967→   967→        where: { roomId: room.id },
+   968→   968→        data: { score: 0, correctCount: 0, ready: false, abilityUsed: false, abilityActive: null },
+   969→   969→      })
+   970→   970→      .catch(() => undefined);
+   971→   971→    await db.gameRoom.update({ where: { id: room.id }, data: { status: "lobby" } }).catch(() => undefined);
+   972→   972→
+   973→   973→    for (const p of room.players.values()) {
+   974→   974→      p.score = 0;
+   975→   975→      p.correctCount = 0;
+   976→   976→      p.ready = false;
+   977→   977→      p.abilityUsed = false;
+   978→   978→      p.abilityArmed = null;
+   979→   979→      p.answered = null;
+   980→   980→      p.eliminated = null;
+   981→   981→      p.readyForNext = false;
+   982→   982→    }
+   983→   983→    room.phase = "lobby";
+   984→   984→    room.qIndex = 0;
+   985→   985→    room.lastSessionId = null;
+   986→   986→    this.broadcastRoomState(room);
+   987→   987→    log(room.code, "rematch — back to lobby");
+   988→   988→  }
+   989→   989→
+   990→   990→  // ----------------------------------------------------------------- ability
+   991→   991→
+   992→   992→  handleAbility(socket: Socket) {
+   993→   993→    const ctx = this.ctx(socket);
+   994→   994→    if (!ctx) return;
+   995→   995→    const { room, player } = ctx;
+   996→   996→    if (room.phase !== "question") {
+   997→   997→      this.emitTo(room, player.pid, "error", { message: "Abilities can only be used during a question." });
+   998→   998→      return;
+   999→   999→    }
+  1000→  1000→    if (player.isAI) return;
+  1001→  1001→    if (player.abilityUsed) {
+  1002→  1002→      this.emitTo(room, player.pid, "error", { message: "Your character ability was already used this match." });
+  1003→  1003→      return;
+  1004→  1004→    }
+  1005→  1005→    if (player.answered) {
+  1006→  1006→      this.emitTo(room, player.pid, "error", { message: "Abilities must be used before answering." });
+  1007→  1007→      return;
+  1008→  1008→    }
+  1009→  1009→
+  1010→  1010→    const ability = CHARACTER_ABILITY[player.characterId];
+  1011→  1011→    const q = room.questions[room.qIndex];
+  1012→  1012→
+  1013→  1013→    if (ability === "second_chance") {
+  1014→  1014→      const wrong = [0, 1, 2, 3].filter((i) => i !== q.correctIndex);
+  1015→  1015→      // Fisher-Yates shuffle then keep two wrong choices.
+  1016→  1016→      for (let i = wrong.length - 1; i > 0; i--) {
+  1017→  1017→        const j = Math.floor(Math.random() * (i + 1));
+  1018→  1018→        [wrong[i], wrong[j]] = [wrong[j], wrong[i]];
+  1019→  1019→      }
+  1020→  1020→      player.eliminated = wrong.slice(0, 2);
+  1021→  1021→      this.emitTo(room, player.pid, "abilityEffect", {
+  1022→  1022→        ability,
+  1023→  1023→        eliminated: player.eliminated,
+  1024→  1024→      });
+  1025→  1025→    } else if (ability === "quick_reflex") {
+  1026→  1026→      if (Date.now() >= player.deadline) {
+  1027→  1027→        this.emitTo(room, player.pid, "error", { message: "Too late — the timer already ran out." });
+  1028→  1028→        return;
+  1029→  1029→      }
+  1030→  1030→      player.deadline += SPRINTER_EXTRA_MS;
+  1031→  1031→      this.emitTo(room, player.pid, "abilityEffect", { ability, endsAt: player.deadline, addedMs: SPRINTER_EXTRA_MS });
+  1032→  1032→    } else {
+  1033→  1033→      // focus_mode / double_down / lucky_break — arm a bonus.
+  1034→  1034→      player.abilityArmed = ability;
+  1035→  1035→      this.emitTo(room, player.pid, "abilityEffect", { ability, armed: true });
+  1036→  1036→    }
+  1037→  1037→
+  1038→  1038→    player.abilityUsed = true;
+  1039→  1039→    db.gameParticipant
+  1040→  1040→      .update({ where: { id: player.pid }, data: { abilityUsed: true, abilityActive: player.abilityArmed } })
+  1041→  1041→      .catch(() => undefined);
+  1042→  1042→    this.emitOthers(room, player.pid, "abilityUsed", { pid: player.pid, name: player.name, ability });
+  1043→  1043→    this.broadcastRoomState(room);
+  1044→  1044→    log(room.code, `${player.name} used ability ${ability}`);
+  1045→  1045→  }
+  1046→  1046→
+  1047→  1047→  // -------------------------------------------------------------------- exit
+  1048→  1048→
+  1049→  1049→  handleLeave(socket: Socket) {
+  1050→  1050→    this.detachSocket(socket);
+  1051→  1051→    socket.disconnect(true);
+  1052→  1052→  }
+  1053→  1053→}
+  1054→  1054→

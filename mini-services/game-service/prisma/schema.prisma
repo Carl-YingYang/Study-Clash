@@ -1,0 +1,183 @@
+// STUDY CLASH — Prisma schema (SQLite)
+// Answer keys (Question.correctIndex) are stored server-side only and are
+// never included in public API responses or realtime payloads before round lock.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(cuid())
+  username     String   @unique
+  passwordHash String
+  characterId  String   @default("thinker")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  documents    Document[]
+  hostedRooms  GameRoom[]      @relation("HostRooms")
+  participants GameParticipant[]
+  results      PlayerResult[]
+}
+
+model Document {
+  id            String   @id @default(cuid())
+  ownerId       String
+  owner         User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  fileName      String
+  fileSize      Int
+  fileType      String // pdf | docx | pptx
+  status        String   @default("processing") // processing | ready | failed | insufficient
+  extractedText String   @default("")
+  textChars     Int      @default(0)
+  pageCount     Int      @default(0)
+  error         String?
+  createdAt     DateTime @default(now())
+
+  quizzes Quiz[]
+
+  @@index([ownerId, createdAt])
+}
+
+model Quiz {
+  id            String   @id @default(cuid())
+  documentId    String
+  document      Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  questionCount Int // 10 | 20 | 30
+  difficulty    String // EASY | NORMAL | HARD
+  status        String   @default("generating") // generating | ready | failed | insufficient
+  error         String?
+  createdAt     DateTime @default(now())
+
+  questions Question[]
+  rooms     GameRoom[]
+
+  @@index([documentId, createdAt])
+}
+
+// PROTECTED: correctIndex lives here (server-side only, never serialized to
+// clients while a match is running; only revealed after a round locks or the
+// game ends).
+model Question {
+  id           String   @id @default(cuid())
+  quizId       String
+  quiz         Quiz     @relation(fields: [quizId], references: [id], onDelete: Cascade)
+  order        Int
+  text         String
+  choices      String // JSON array of 4 strings
+  correctIndex Int
+  explanation  String   @default("")
+  sourceRef    String? // supporting excerpt from the source document
+  difficulty   String   @default("NORMAL")
+
+  @@unique([quizId, order])
+  @@index([quizId])
+}
+
+model GameRoom {
+  id             String    @id @default(cuid())
+  code           String    @unique
+  mode           String // CLASH | PRACTICE
+  status         String    @default("lobby") // lobby | playing | finished | abandoned
+  hostId         String
+  host           User      @relation("HostRooms", fields: [hostId], references: [id])
+  quizId         String
+  quiz           Quiz      @relation(fields: [quizId], references: [id])
+  questionCount  Int
+  difficulty     String
+  timerSeconds   Int // 10 | 15 | 20
+  aiLevel        String? // EASY | MID | HARD | GENIUS (practice only)
+  createdAt      DateTime  @default(now())
+  endedAt        DateTime?
+
+  participants GameParticipant[]
+
+  @@index([status, createdAt])
+}
+
+model GameParticipant {
+  id            String    @id @default(cuid())
+  roomId        String
+  room          GameRoom  @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  userId        String? // null => AI opponent
+  user          User?     @relation(fields: [userId], references: [id])
+  displayName   String
+  characterId   String    @default("thinker")
+  isHost        Boolean   @default(false)
+  isAI          Boolean   @default(false)
+  aiLevel       String?
+  score         Int       @default(0)
+  correctCount  Int       @default(0)
+  ready         Boolean   @default(false)
+  abilityUsed   Boolean   @default(false)
+  abilityActive String? // currently armed ability (scholar/trickster/wildcard pending)
+  joinedAt      DateTime  @default(now())
+
+  answers PlayerAnswer[]
+
+  @@index([roomId])
+  @@index([userId])
+}
+
+model PlayerAnswer {
+  id            String          @id @default(cuid())
+  participantId String
+  participant   GameParticipant @relation(fields: [participantId], references: [id], onDelete: Cascade)
+  questionIndex Int
+  choiceIndex   Int? // null => timed out
+  timeMs        Int             @default(0)
+  correct       Boolean         @default(false)
+  points        Int             @default(0)
+  abilityBonus  Int             @default(0)
+
+  @@unique([participantId, questionIndex])
+  @@index([participantId])
+}
+
+// One record per COMPLETED match (never for abandoned games).
+// History records are intentionally denormalized (roomId as a plain string)
+// so deleting documents/rooms later never destroys leaderboard history.
+model GameSession {
+  id             String   @id @default(cuid())
+  roomId         String
+  mode           String // CLASH | PRACTICE
+  questionCount  Int // 10 | 20 | 30
+  difficulty     String // EASY | NORMAL | HARD
+  timerSeconds   Int
+  finishedAt     DateTime @default(now())
+
+  results PlayerResult[]
+
+  @@index([roomId])
+  @@index([mode, questionCount, difficulty])
+}
+
+// Per-player record of a completed match (leaderboard source of truth).
+// Fully denormalized — no FK back to live match rows.
+model PlayerResult {
+  id             String       @id @default(cuid())
+  sessionId      String
+  session        GameSession  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  participantId  String
+  userId         String? // null => AI opponent
+  user           User?        @relation(fields: [userId], references: [id])
+  displayName    String
+  characterId    String
+  isAI           Boolean      @default(false)
+  aiLevel        String?
+  score          Int
+  correctCount   Int
+  totalQuestions Int
+  accuracy       Float // 0..1
+  avgTimeMs      Int
+  abilityUsed    Boolean      @default(false)
+  won            Boolean      @default(false)
+
+  @@index([participantId])
+  @@index([userId, sessionId])
+}
