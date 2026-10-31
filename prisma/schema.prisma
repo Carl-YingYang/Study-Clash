@@ -80,46 +80,64 @@ model Question {
   @@index([quizId])
 }
 
-model GameRoom {
-  id             String    @id @default(cuid())
-  code           String    @unique
-  mode           String // CLASH | PRACTICE
-  status         String    @default("lobby") // lobby | playing | finished | abandoned
-  hostId         String
-  host           User      @relation("HostRooms", fields: [hostId], references: [id])
-  quizId         String
-  quiz           Quiz      @relation(fields: [quizId], references: [id])
-  questionCount  Int
-  difficulty     String
-  timerSeconds   Int // 10 | 15 | 20
-  aiLevel        String? // EASY | MID | HARD | GENIUS (practice only)
-  createdAt      DateTime  @default(now())
-  endedAt        DateTime?
 
-  participants GameParticipant[]
+model GameRoom {
+  id                  String    @id @default(cuid())
+  code                String    @unique
+  mode                String
+  status              String    @default("lobby")
+  hostId              String
+  host                User      @relation("HostRooms", fields: [hostId], references: [id])
+  quizId              String
+  quiz                Quiz      @relation(fields: [quizId], references: [id])
+  questionCount       Int
+  difficulty          String
+  timerSeconds        Int
+  aiLevel             String?
+
+  // Persistent multiplayer runtime state
+  phase               String    @default("lobby")
+  currentQuestionIndex Int      @default(0)
+  phaseStartedAt      DateTime?
+  phaseEndsAt         DateTime?
+  stateVersion        Int       @default(0)
+
+  createdAt           DateTime  @default(now())
+  endedAt             DateTime?
+
+  participants        GameParticipant[]
 
   @@index([status, createdAt])
 }
 
-model GameParticipant {
-  id            String    @id @default(cuid())
-  roomId        String
-  room          GameRoom  @relation(fields: [roomId], references: [id], onDelete: Cascade)
-  userId        String? // null => AI opponent
-  user          User?     @relation(fields: [userId], references: [id])
-  displayName   String
-  characterId   String    @default("thinker")
-  isHost        Boolean   @default(false)
-  isAI          Boolean   @default(false)
-  aiLevel       String?
-  score         Int       @default(0)
-  correctCount  Int       @default(0)
-  ready         Boolean   @default(false)
-  abilityUsed   Boolean   @default(false)
-  abilityActive String? // currently armed ability (scholar/trickster/wildcard pending)
-  joinedAt      DateTime  @default(now())
 
-  answers PlayerAnswer[]
+model GameParticipant {
+  id                  String    @id @default(cuid())
+  roomId              String
+  room                GameRoom  @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  userId              String?
+  user                User?     @relation(fields: [userId], references: [id])
+  displayName         String
+  characterId         String    @default("thinker")
+  isHost              Boolean   @default(false)
+  isAI                Boolean   @default(false)
+  aiLevel             String?
+  score               Int       @default(0)
+  correctCount        Int       @default(0)
+  ready               Boolean   @default(false)
+  abilityUsed         Boolean   @default(false)
+  abilityActive       String?
+
+  // Persistent per-player runtime state
+  answerDeadline      DateTime?
+  eliminatedChoices   String    @default("[]")
+  readyForNext        Boolean   @default(false)
+  pendingAiChoice     Int?
+  pendingAiAt         DateTime?
+
+  joinedAt            DateTime  @default(now())
+
+  answers             PlayerAnswer[]
 
   @@index([roomId])
   @@index([userId])

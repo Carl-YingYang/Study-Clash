@@ -1,15 +1,26 @@
+"use client";
 
 import { createClient } from "@supabase/supabase-js";
 
-export function createSupabaseBrowserClient() {
-  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
+let supabaseBrowser: ReturnType<typeof createClient> | null = null;
 
-  if (!supabaseUrl || !supabaseKey) {
-    throw new Error(
-      "Missing Supabase configuration. Check NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY."
-    );
+export function getSupabaseBrowserClient() {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const publishableKey = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
+
+  if (!url || !publishableKey) {
+    throw new Error("Missing Supabase browser environment variables.");
   }
 
-  return createClient(supabaseUrl, supabaseKey);
+  if (!supabaseBrowser) {
+    supabaseBrowser = createClient(url, publishableKey, {
+      auth: {
+        autoRefreshToken: false,
+        persistSession: false,
+        detectSessionInUrl: false,
+      },
+    });
+  }
+
+  return supabaseBrowser;
 }
